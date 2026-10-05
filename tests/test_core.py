@@ -61,8 +61,8 @@ def test_risk_gate_rejects_unsafe_trade():
 
 def test_quantity_and_position_limits():
     gate = RiskGate(RiskBudget(10_000))
-    assert gate.calculate_quantity(10_000, 50_000, 0.01) == 0.2
-    assert gate.position_limit(10_000, 0.001, 50_000)
+    assert gate.calculate_quantity(10_000, 50_000, 0.01) == 0.004
+    assert gate.position_limit(10_000, 0.004, 50_000)
     assert not gate.position_limit(10_000, 1.0, 50_000)
 
 

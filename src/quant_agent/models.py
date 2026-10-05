@@ -13,6 +13,7 @@ class MarketSnapshot:
     timestamp: datetime
     source: str
     instrument: str
+    price: float | None = None
     kline_base64: str | None = None
     orderbook_imbalance: float | None = None
     cvd: float | None = None

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 import os
+from datetime import datetime
 from typing import Any
 
 import httpx
 
-from .models import Decision, ExchangeSnapshot, OrderResult, RiskBudget, utc_now
+from .models import Decision, ExchangeSnapshot, MarketSnapshot, OrderResult
 
 
 class GeminiClient:
@@ -36,8 +36,28 @@ class GateIoAdapter:
         self.api_key = api_key or os.getenv("GATEIO_API_KEY")
         self.secret = secret or os.getenv("GATEIO_SECRET")
         self.base_url = base_url.rstrip("/")
+        self.live = bool(os.getenv("ALLOW_LIVE_TRADING", "").lower() in {"1", "true", "yes"})
+        if self.api_key and self.secret:
+            self.live = self.live
+
+    def market_snapshot(self, *, timestamp: datetime) -> MarketSnapshot:
         if not self.api_key or not self.secret:
-            raise ValueError("GATEIO_API_KEY and GATEIO_SECRET are required")
+            raise ValueError("Gate.io credentials are required for market data")
+        with httpx.Client(timeout=15.0) as client:
+            response = client.get(
+                f"{self.base_url}/spot/v2/spot/price",
+                auth=(self.api_key, self.secret),
+                params={"symbol": "BTC/USDT"},
+            )
+            response.raise_for_status()
+            data = response.json()
+        price = float(data["price"])
+        return MarketSnapshot(
+            timestamp=timestamp,
+            source="gateio",
+            instrument="BTC/USDT:USDT",
+            price=price,
+        )
 
     def get_snapshot(self) -> ExchangeSnapshot:
         with httpx.Client(timeout=15.0) as client:
@@ -92,8 +112,14 @@ class GateIoAdapter:
 
 
 def market_price_from_decision(decision: Decision, price: float) -> tuple[float, float]:
-    stop = price * (1.0 - decision.stop_loss_pct)
-    target = price * (1.0 + decision.take_profit_pct)
+    if decision.action == "LONG":
+        stop = price * (1.0 - decision.stop_loss_pct)
+        target = price * (1.0 + decision.take_profit_pct)
+    elif decision.action == "SHORT":
+        stop = price * (1.0 + decision.stop_loss_pct)
+        target = price * (1.0 - decision.take_profit_pct)
+    else:
+        raise ValueError("HOLD cannot create an order")
     return stop, target
 
 

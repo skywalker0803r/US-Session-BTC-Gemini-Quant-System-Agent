@@ -40,7 +40,9 @@ class RiskGate:
         if equity <= 0 or price <= 0 or stop_loss_pct <= 0:
             raise ValueError("Equity, price, and stop-loss must be positive")
         risk_amount = equity * risk_budget_pct
-        return risk_amount / (price * stop_loss_pct)
+        risk_based_quantity = risk_amount / (price * stop_loss_pct)
+        position_based_quantity = equity * self.budget.max_position_pct / price
+        return min(risk_based_quantity, position_based_quantity)
 
     def position_limit(self, equity: float, quantity: float, price: float) -> bool:
         if quantity <= 0 or price <= 0:

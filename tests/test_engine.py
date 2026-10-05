@@ -8,7 +8,13 @@ from quant_agent.storage import EventStore
 
 class Market:
     def snapshot(self, *, timestamp):
-        return MarketSnapshot(timestamp, "test", "BTC/USDT:USDT", orderbook_imbalance=0.01)
+        return MarketSnapshot(
+            timestamp,
+            "test",
+            "BTC/USDT:USDT",
+            price=50_000.0,
+            orderbook_imbalance=0.01,
+        )
 
 
 class Exchange:
@@ -57,3 +63,13 @@ def test_agent_blocks_existing_position(tmp_path):
     agent = QuantAgent(Market(), Gemini(), exchange, RiskGate(RiskBudget(10_000)), store)
     agent.run_once()
     assert len([event for event in store.list_events() if event["type"] == "EXECUTION_REJECTED"]) == 1
+
+
+def test_agent_uses_live_price_and_risk_calculated_quantity(tmp_path):
+    exchange = Exchange()
+    store = EventStore(tmp_path)
+    agent = QuantAgent(Market(), Gemini(), exchange, RiskGate(RiskBudget(10_000)), store)
+    agent.run_once()
+    order = exchange.calls[1][1]
+    assert order["price"] == 50_000.0
+    assert order["quantity"] == 0.004

@@ -59,6 +59,7 @@ class GeminiDecisionEngine:
                 {"role": "user", "parts": [{"text": json.dumps({
                     "snapshot_id": snapshot.timestamp.isoformat(),
                     "instrument": "BTC/USDT:USDT",
+                    "price": snapshot.price,
                     "macro_summary": snapshot.macro_summary,
                     "orderbook_imbalance": snapshot.orderbook_imbalance,
                     "cvd": snapshot.cvd,

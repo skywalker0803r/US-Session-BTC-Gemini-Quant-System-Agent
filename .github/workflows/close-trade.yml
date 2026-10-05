@@ -1,0 +1,50 @@
+name: Close BTC positions
+
+on:
+  schedule:
+    - cron: "50 19 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  close-trade:
+    max-parallel: 1
+
+jobs:
+  close-trade:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Close all open positions
+        env:
+          GATEIO_API_KEY: ${{ secrets.GATEIO_API_KEY }}
+          GATEIO_SECRET: ${{ secrets.GATEIO_SECRET }}
+          ALLOW_LIVE_TRADING: "true"
+        run: |
+          mkdir -p ./events
+          python -m quant_agent.cli --mode live --action close --events ./events
+
+      - name: Upload close audit events
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: close-trade-audit
+          path: ./events
+          if-no-files-found: ignore
+          retention-days: 30

@@ -57,6 +57,33 @@ python -m quant_agent.cli --events ./events
 
 預設模擬模式不會呼叫 Gemini、Gate.io 或其他外部服務，並將決策與交易操作記錄到本機稽核目錄。
 
+## GitHub Actions 自動化
+
+開盤與清倉工作流位於 `.github/workflows/`：
+
+- 開盤：美國工作日 21:45（America/New_York）執行。
+- 清倉：美國收盤前 10 分鐘 15:50（America/New_York）執行。
+- 目前夏令時段對應 UTC 01:45 與 19:50。
+- `workflow_dispatch` 可供人工測試；定時工作流只在 `production` environment 執行。
+
+GitHub Actions 的 cron 是 UTC 時間，無法自動切換夏令／冬令。正式上線前，應依照當前時段更新 cron；若要跨夏令／冬令自動切換，建議改為每小時執行一次，再由程式以 `America/New_York` 判斷窗口。
+
+## 實盤串接要求
+
+```bash
+export GEMINI_API_KEY=...
+export GATEIO_API_KEY=...
+export GATEIO_SECRET=...
+export ALLOW_LIVE_TRADING=true
+```
+
+```bash
+python -m quant_agent.cli --mode live --action open --events ./events
+python -m quant_agent.cli --mode live --action close --events ./events
+```
+
+實盤模式要求所有金鑰與 `ALLOW_LIVE_TRADING=true`，並在 GitHub 的 `production` environment 中設定必要的 approver。這樣可以避免只有程式碼權限就能啟用實盤交易。
+
 ## 執行測試
 
 ```bash
