@@ -1,0 +1,59 @@
+from datetime import datetime, timezone
+
+from quant_agent.engine import QuantAgent
+from quant_agent.models import Decision, ExchangeSnapshot, MarketSnapshot, OrderResult, RiskBudget
+from quant_agent.risk import RiskGate
+from quant_agent.storage import EventStore
+
+
+class Market:
+    def snapshot(self, *, timestamp):
+        return MarketSnapshot(timestamp, "test", "BTC/USDT:USDT", orderbook_imbalance=0.01)
+
+
+class Exchange:
+    def __init__(self):
+        self.calls = []
+
+    def set_leverage(self, leverage):
+        self.calls.append(("set_leverage", leverage))
+        return True
+
+    def get_snapshot(self):
+        return ExchangeSnapshot(14.0, "isolated", 0, ())
+
+    def place_order(self, **kwargs):
+        self.calls.append(("place_order", kwargs))
+        return OrderResult("SIM-1", kwargs["side"], kwargs["quantity"], kwargs["price"], "SIMULATED")
+
+    def close_positions(self):
+        return []
+
+
+class Gemini:
+    def decide(self, snapshot):
+        return Decision("LONG", 0.82, 0.012, 0.028, "test", "gemini-2.5-flash", "v1", datetime.now(timezone.utc), snapshot.timestamp.isoformat())
+
+
+def test_agent_records_decision_and_order_without_live_exchange(tmp_path):
+    exchange = Exchange()
+    store = EventStore(tmp_path)
+    agent = QuantAgent(Market(), Gemini(), exchange, RiskGate(RiskBudget(10_000)), store)
+    result = agent.run_once()
+    assert result.action == "LONG"
+    assert exchange.calls[0] == ("set_leverage", 14.0)
+    assert exchange.calls[1][0] == "place_order"
+    events = store.list_events()
+    assert {event["type"] for event in events} == {"DECISION", "ORDER_PLACED"}
+
+
+def test_agent_blocks_existing_position(tmp_path):
+    class PositionExchange(Exchange):
+        def get_snapshot(self):
+            return ExchangeSnapshot(14.0, "isolated", 1, ({"size": 0.1},))
+
+    exchange = PositionExchange()
+    store = EventStore(tmp_path)
+    agent = QuantAgent(Market(), Gemini(), exchange, RiskGate(RiskBudget(10_000)), store)
+    agent.run_once()
+    assert len([event for event in store.list_events() if event["type"] == "EXECUTION_REJECTED"]) == 1
