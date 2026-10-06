@@ -86,6 +86,9 @@ class QuantAgent:
     def close_all(self) -> list[OrderResult]:
         try:
             results = self.exchange.close_positions()
+            failures = getattr(self.exchange, "close_failures", ())
+            if failures:
+                self._record_event("CLOSE_POSITION_FAILED", failures=list(failures))
             self._record_event("CLOSE_ALL", results=[result.__dict__ for result in results])
             return results
         except Exception as exc:

@@ -88,6 +88,31 @@ def test_agent_records_close_request_and_exchange_response(tmp_path):
     assert close["exchange_response"] == {"id": "SIM-CLOSE", "status": "FILLED"}
 
 
+def test_agent_records_close_failure_and_keeps_position_managed(tmp_path):
+    class FailingExchange(Exchange):
+        def close_positions(self):
+            self.close_failures = [{
+                "position_id": "pos-1",
+                "error": "Gate.io returned HTTP 503",
+                "status_code": 503,
+                "attempts": 3,
+            }]
+            return []
+
+    exchange = FailingExchange()
+    store = EventStore(tmp_path)
+    agent = QuantAgent(Market(), Gemini(), exchange, RiskGate(RiskBudget(10_000)), store)
+
+    results = agent.close_all()
+
+    assert results == []
+    event_types = [event["type"] for event in store.list_events()]
+    assert event_types == ["CLOSE_ALL", "CLOSE_POSITION_FAILED"]
+    failure = store.list_events("CLOSE_POSITION_FAILED")[0]["attributes"]["failures"][0]
+    assert failure["position_id"] == "pos-1"
+    assert failure["error"] == "Gate.io returned HTTP 503"
+
+
 def test_agent_blocks_existing_position(tmp_path):
     class PositionExchange(Exchange):
         def get_snapshot(self):

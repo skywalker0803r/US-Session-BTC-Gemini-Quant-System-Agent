@@ -25,9 +25,11 @@ class StubTransport(httpx.MockTransport):
 
 
 class RetryTransport(httpx.MockTransport):
-    def __init__(self) -> None:
+    def __init__(self, *, status_code: int = 503, failures_before_success: int = 2) -> None:
         self.requests: list[httpx.Request] = []
         self.order_attempts = 0
+        self.status_code = status_code
+        self.failures_before_success = failures_before_success
         super().__init__(self._handle)
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
@@ -40,8 +42,8 @@ class RetryTransport(httpx.MockTransport):
             }])
         if request.method == "POST" and request.url.path.endswith("/orders"):
             self.order_attempts += 1
-            if self.order_attempts == 1:
-                return httpx.Response(503)
+            if self.order_attempts <= self.failures_before_success:
+                return httpx.Response(self.status_code)
             return httpx.Response(200, json={"id": "order-1", "status": "FILLED"})
         return httpx.Response(404)
 
@@ -112,7 +114,76 @@ def test_close_positions_retries_transient_order_failure(monkeypatch, tmp_path: 
 
     assert len(results) == 1
     assert results[0].order_id == "order-1"
-    assert transport.order_attempts == 2
-    assert len(transport.requests) == 3
-    assert transport.requests[2].method == "POST"
+    assert transport.order_attempts == 3
+    assert len(transport.requests) == 4
+    assert transport.requests[3].method == "POST"
     assert adapter.managed_position_ids == set()
+
+
+def test_close_positions_retries_rate_limit_and_preserves_position(monkeypatch, tmp_path: Path) -> None:
+    transport = RetryTransport(status_code=429)
+    original_client = httpx.Client
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", client_factory)
+    adapter = GateIoAdapter(
+        api_key="key",
+        secret="secret",
+        position_store=tmp_path / "positions.json",
+    )
+    adapter.managed_position_ids.add("pos-1")
+
+    results = adapter.close_positions()
+
+    assert len(results) == 1
+    assert results[0].status == "FILLED"
+    assert transport.order_attempts == 3
+    assert adapter.managed_position_ids == set()
+
+
+def test_close_positions_does_not_retry_client_error(monkeypatch, tmp_path: Path) -> None:
+    transport = RetryTransport(status_code=400)
+    original_client = httpx.Client
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", client_factory)
+    adapter = GateIoAdapter(
+        api_key="key",
+        secret="secret",
+        position_store=tmp_path / "positions.json",
+    )
+    adapter.managed_position_ids.add("pos-1")
+
+    results = adapter.close_positions()
+
+    assert results == []
+    assert transport.order_attempts == 1
+    assert adapter.managed_position_ids == {"pos-1"}
+
+
+def test_close_positions_stops_after_retry_limit_and_records_failure(monkeypatch, tmp_path: Path) -> None:
+    transport = RetryTransport(status_code=503, failures_before_success=99)
+    original_client = httpx.Client
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", client_factory)
+    adapter = GateIoAdapter(
+        api_key="key",
+        secret="secret",
+        position_store=tmp_path / "positions.json",
+        max_close_attempts=3,
+        retry_delay_seconds=0.0,
+    )
+    adapter.managed_position_ids.add("pos-1")
+
+    results = adapter.close_positions()
+
+    assert results == []
+    assert transport.order_attempts == 3
+    assert adapter.managed_position_ids == {"pos-1"}

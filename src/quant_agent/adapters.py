@@ -4,6 +4,7 @@ import base64
 import json
 import math
 import os
+import time
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Protocol
@@ -88,12 +89,24 @@ class GeminiClient:
 
 
 class GateIoAdapter:
-    def __init__(self, api_key: str | None = None, secret: str | None = None, *, base_url: str = "https://api.gateio.ws/api/v4", position_store: Path | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        secret: str | None = None,
+        *,
+        base_url: str = "https://api.gateio.ws/api/v4",
+        position_store: Path | None = None,
+        max_close_attempts: int = 3,
+        retry_delay_seconds: float = 1.0,
+    ) -> None:
         self.api_key = api_key or os.getenv("GATEIO_API_KEY")
         self.secret = secret or os.getenv("GATEIO_SECRET")
         self.base_url = base_url.rstrip("/")
         self.live = bool(os.getenv("ALLOW_LIVE_TRADING", "").lower() in {"1", "true", "yes"})
         self.position_store = position_store
+        self.max_close_attempts = max_close_attempts
+        self.retry_delay_seconds = retry_delay_seconds
+        self.close_failures: list[dict[str, Any]] = []
         self.managed_position_ids: set[str] = self._load_position_ids()
         if self.api_key and self.secret:
             self.live = self.live
@@ -210,6 +223,7 @@ class GateIoAdapter:
 
     def close_positions(self) -> list[OrderResult]:
         results: list[OrderResult] = []
+        self.close_failures.clear()
         with httpx.Client(timeout=15.0) as client:
             response = client.get(f"{self.base_url}/futures/usdt/v1/spot/positions", auth=(self.api_key, self.secret), params={"symbol": "BTC/USDT:USDT"})
             response.raise_for_status()
@@ -218,16 +232,21 @@ class GateIoAdapter:
                 position_id = str(position.get("positionId") or position.get("position_id") or "")
                 if position_id not in self.managed_position_ids or float(position.get("size", 0.0)) == 0:
                     continue
-                response = client.post(f"{self.base_url}/futures/usdt/v1/spot/orders", auth=(self.api_key, self.secret), json={
-                    "symbol": "BTC/USDT:USDT", "side": "SELL" if position.get("side") == "LONG" else "BUY",
-                    "amount": float(position["size"]), "type": "MARKET", "reduceOnly": True, "closePosition": True,
-                })
-                response.raise_for_status()
-                data = response.json()
                 close_payload = {
                     "symbol": "BTC/USDT:USDT", "side": "SELL" if position.get("side") == "LONG" else "BUY",
                     "amount": float(position["size"]), "type": "MARKET", "reduceOnly": True, "closePosition": True,
                 }
+                try:
+                    data = self._post_close_order(client, close_payload)
+                except httpx.HTTPStatusError as exc:
+                    error = self._error_message(exc.response)
+                    self.close_failures.append({
+                        "position_id": position_id,
+                        "error": error,
+                        "status_code": exc.response.status_code,
+                        "attempts": self.max_close_attempts,
+                    })
+                    continue
                 results.append(OrderResult(
                     str(data["id"]), "CLOSE", float(position["size"]), 0.0,
                     str(data.get("status", "UNKNOWN")), request_payload=close_payload,
@@ -236,6 +255,38 @@ class GateIoAdapter:
                 self.managed_position_ids.discard(position_id)
                 self._save_position_ids()
         return results
+
+    def _post_close_order(self, client: httpx.Client, payload: dict[str, Any]) -> dict[str, Any]:
+        for attempt in range(1, self.max_close_attempts + 1):
+            response = client.post(
+                f"{self.base_url}/futures/usdt/v1/spot/orders",
+                auth=(self.api_key, self.secret),
+                json=payload,
+            )
+            if response.is_success:
+                return response.json()
+            if response.status_code not in {429, 500, 502, 503, 504} or attempt == self.max_close_attempts:
+                response.raise_for_status()
+            retry_after = response.headers.get("retry-after")
+            delay = self.retry_delay_seconds
+            if retry_after:
+                try:
+                    delay = max(delay, float(retry_after))
+                except ValueError:
+                    pass
+            time.sleep(delay)
+        raise RuntimeError("Close order retry loop exhausted")
+
+    @staticmethod
+    def _error_message(response: httpx.Response) -> str:
+        try:
+            payload = response.json()
+            message = payload.get("error") or payload.get("message") or payload.get("msg")
+            if message:
+                return str(message)
+        except (ValueError, TypeError):
+            pass
+        return f"Gate.io returned HTTP {response.status_code}"
 
     def set_leverage(self, leverage: float) -> bool:
         with httpx.Client(timeout=15.0) as client:
