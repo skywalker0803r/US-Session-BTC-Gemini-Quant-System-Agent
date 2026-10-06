@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 from datetime import datetime
 from typing import Any
 
@@ -32,20 +34,37 @@ class GeminiClient:
 
 
 class GateIoAdapter:
-    def __init__(self, api_key: str | None = None, secret: str | None = None, *, base_url: str = "https://api.gateio.ws/api/v4") -> None:
+    def __init__(self, api_key: str | None = None, secret: str | None = None, *, base_url: str = "https://api.gateio.ws/api/v4", position_store: Path | None = None) -> None:
         self.api_key = api_key or os.getenv("GATEIO_API_KEY")
         self.secret = secret or os.getenv("GATEIO_SECRET")
         self.base_url = base_url.rstrip("/")
         self.live = bool(os.getenv("ALLOW_LIVE_TRADING", "").lower() in {"1", "true", "yes"})
+        self.position_store = position_store
+        self.managed_position_ids: set[str] = self._load_position_ids()
         if self.api_key and self.secret:
             self.live = self.live
+
+    def _load_position_ids(self) -> set[str]:
+        if self.position_store is None:
+            return set()
+        try:
+            data = json.loads(self.position_store.read_text())
+            return {str(position_id) for position_id in data.get("position_ids", [])}
+        except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError):
+            return set()
+
+    def _save_position_ids(self) -> None:
+        if self.position_store is None:
+            return
+        self.position_store.parent.mkdir(parents=True, exist_ok=True)
+        self.position_store.write_text(json.dumps({"position_ids": sorted(self.managed_position_ids)}, indent=2))
 
     def market_snapshot(self, *, timestamp: datetime) -> MarketSnapshot:
         if not self.api_key or not self.secret:
             raise ValueError("Gate.io credentials are required for market data")
         with httpx.Client(timeout=15.0) as client:
             response = client.get(
-                f"{self.base_url}/spot/v2/spot/price",
+                f"{self.base_url}/futures/usdt/v1/spot/price",
                 auth=(self.api_key, self.secret),
                 params={"symbol": "BTC/USDT"},
             )
@@ -61,7 +80,7 @@ class GateIoAdapter:
 
     def get_snapshot(self) -> ExchangeSnapshot:
         with httpx.Client(timeout=15.0) as client:
-            response = client.get(f"{self.base_url}/spot/v2/spot/accounts", auth=(self.api_key, self.secret))
+            response = client.get(f"{self.base_url}/futures/usdt/v1/spot/accounts", auth=(self.api_key, self.secret))
             response.raise_for_status()
             data = response.json()
         return ExchangeSnapshot(
@@ -76,9 +95,13 @@ class GateIoAdapter:
             "takeProfitPrice": take_profit_price, "closePosition": False,
         }
         with httpx.Client(timeout=15.0) as client:
-            response = client.post(f"{self.base_url}/spot/v2/spot/orders", auth=(self.api_key, self.secret), json=payload)
+            response = client.post(f"{self.base_url}/futures/usdt/v1/spot/orders", auth=(self.api_key, self.secret), json=payload)
             response.raise_for_status()
             data = response.json()
+        position_id = data.get("positionId") or data.get("position_id")
+        if position_id:
+            self.managed_position_ids.add(str(position_id))
+            self._save_position_ids()
         return OrderResult(
             order_id=str(data["id"]), side=side, quantity=float(data.get("amount", quantity)),
             price=float(data.get("price", price)), status=str(data.get("status", "UNKNOWN")),
@@ -89,24 +112,27 @@ class GateIoAdapter:
     def close_positions(self) -> list[OrderResult]:
         results: list[OrderResult] = []
         with httpx.Client(timeout=15.0) as client:
-            response = client.get(f"{self.base_url}/spot/v2/spot/positions", auth=(self.api_key, self.secret), params={"symbol": "BTC/USDT:USDT"})
+            response = client.get(f"{self.base_url}/futures/usdt/v1/spot/positions", auth=(self.api_key, self.secret), params={"symbol": "BTC/USDT:USDT"})
             response.raise_for_status()
             positions = response.json()
         for position in positions:
-            if float(position.get("size", 0.0)) == 0:
+            position_id = str(position.get("positionId") or position.get("position_id") or "")
+            if position_id not in self.managed_position_ids or float(position.get("size", 0.0)) == 0:
                 continue
-            response = client.post(f"{self.base_url}/spot/v2/spot/orders", auth=(self.api_key, self.secret), json={
+            response = client.post(f"{self.base_url}/futures/usdt/v1/spot/orders", auth=(self.api_key, self.secret), json={
                 "symbol": "BTC/USDT:USDT", "side": "SELL" if position.get("side") == "LONG" else "BUY",
                 "amount": float(position["size"]), "type": "MARKET", "closePosition": True,
             })
             response.raise_for_status()
             data = response.json()
             results.append(OrderResult(str(data["id"]), "CLOSE", float(position["size"]), 0.0, str(data.get("status", "UNKNOWN"))))
+            self.managed_position_ids.discard(position_id)
+            self._save_position_ids()
         return results
 
     def set_leverage(self, leverage: float) -> bool:
         with httpx.Client(timeout=15.0) as client:
-            response = client.post(f"{self.base_url}/spot/v2/spot/leverage", auth=(self.api_key, self.secret), json={"leverage": leverage})
+            response = client.post(f"{self.base_url}/futures/usdt/v1/spot/leverage", auth=(self.api_key, self.secret), json={"leverage": leverage})
             response.raise_for_status()
             return response.json().get("success", True)
 

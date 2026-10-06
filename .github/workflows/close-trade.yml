@@ -3,6 +3,7 @@ name: Close BTC positions
 on:
   schedule:
     - cron: "50 19 * * 1-5"
+    - cron: "50 20 * * 1-5"
   workflow_dispatch:
 
 permissions:
@@ -38,7 +39,7 @@ jobs:
           ALLOW_LIVE_TRADING: "true"
         run: |
           mkdir -p ./events
-          python -m quant_agent.cli --mode live --action close --events ./events
+          python -m quant_agent.cli --mode live --action close --events ./events --position-store ./events/positions.json
 
       - name: Upload close audit events
         if: always()

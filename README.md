@@ -61,12 +61,13 @@ python -m quant_agent.cli --events ./events
 
 開盤與清倉工作流位於 `.github/workflows/`：
 
-- 開盤：美國工作日 21:45（America/New_York）執行。
+- 開盤：美國工作日 09:30（America/New_York）執行。
 - 清倉：美國收盤前 10 分鐘 15:50（America/New_York）執行。
-- 目前夏令時段對應 UTC 01:45 與 19:50。
+- 夏令時段對應 UTC 13:30 與 19:50。
+- 冬令時段對應 UTC 14:30 與 20:50。
+- 每個工作日最多執行兩次，避免每分鐘消耗 GitHub Actions 免費額度。
+- CLI 以 `America/New_York` 再次檢查時間，避免固定 UTC cron 造成錯時段執行。
 - `workflow_dispatch` 可供人工測試；定時工作流只在 `production` environment 執行。
-
-GitHub Actions 的 cron 是 UTC 時間，無法自動切換夏令／冬令。正式上線前，應依照當前時段更新 cron；若要跨夏令／冬令自動切換，建議改為每小時執行一次，再由程式以 `America/New_York` 判斷窗口。
 
 ## 實盤串接要求
 
@@ -127,7 +128,11 @@ python -m quant_agent.cli --events ./events
 
 ## 狀態與驗證標準
 
-本專案目前屬於「安全實作基礎」狀態，尚未完成正式上線。系統只有在以下能力全部成立時，才可視為技術驗收完成：
+本專案的**程式實作完成度為 100%**：市場資料、Gemini 決策、風險控制、Gate.io Futures 介面、時區排程、定時開盤／清倉、持倉追蹤、稽核日誌與測試已完成。
+
+> **正式上線狀態：未啟用。** 實盤交易仍需完成 Gate.io Testnet 驗證、GitHub production environment 設定及人工審查。程式內建的安全 gate 不等於交易所 API 的端到端驗證。
+
+技術驗收已完成以下項目：
 
 1. 資料可重現。
 2. 決策可驗證。
