@@ -1,128 +1,163 @@
 from __future__ import annotations
 
 import json
-import re
+import os
+from pathlib import Path
 from datetime import datetime
 from typing import Any
 
-from .models import Decision, MarketSnapshot
-from .risk import RiskGate
+import httpx
+
+from .models import Decision, ExchangeSnapshot, MarketSnapshot, OrderResult
 
 
-DECISION_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["action", "confidence", "stop_loss_pct", "take_profit_pct", "reasoning"],
-    "properties": {
-        "action": {"enum": ["LONG", "SHORT", "HOLD"]},
-        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-        "stop_loss_pct": {"type": "number", "minimum": 0.008, "maximum": 0.020},
-        "take_profit_pct": {"type": "number", "minimum": 0.020, "maximum": 0.040},
-        "reasoning": {"type": "string", "maxLength": 100},
-    },
-}
+class GeminiClient:
+    def __init__(self, api_key: str | None = None, base_url: str = "https://generativelanguage.googleapis.com/v1beta") -> None:
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
+        if not self.api_key:
+            raise ValueError("GEMINI_API_KEY is required")
+        self.base_url = base_url.rstrip("/")
+
+    def complete(self, payload: dict[str, Any], *, model: str) -> dict[str, Any]:
+        endpoint = f"{self.base_url}/models/{model}:generateContent"
+        with httpx.Client(timeout=20.0) as client:
+            response = client.post(endpoint, params={"key": self.api_key}, json=payload)
+            response.raise_for_status()
+            data = response.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            raise RuntimeError("Gemini returned no candidates")
+        text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text")
+        if not text:
+            raise RuntimeError("Gemini returned empty content")
+        return {"text": text}
 
 
-class DecisionValidationError(ValueError):
-    pass
+class GateIoAdapter:
+    def __init__(self, api_key: str | None = None, secret: str | None = None, *, base_url: str = "https://api.gateio.ws/api/v4", position_store: Path | None = None) -> None:
+        self.api_key = api_key or os.getenv("GATEIO_API_KEY")
+        self.secret = secret or os.getenv("GATEIO_SECRET")
+        self.base_url = base_url.rstrip("/")
+        self.live = bool(os.getenv("ALLOW_LIVE_TRADING", "").lower() in {"1", "true", "yes"})
+        self.position_store = position_store
+        self.managed_position_ids: set[str] = self._load_position_ids()
+        if self.api_key and self.secret:
+            self.live = self.live
 
-
-class GeminiDecisionEngine:
-    def __init__(self, client: Any, risk_gate: RiskGate, *, prompt_version: str = "v1", enable_grounding: bool = True) -> None:
-        self.client = client
-        self.risk_gate = risk_gate
-        self.prompt_version = prompt_version
-        self.enable_grounding = enable_grounding
-
-    def decide(self, snapshot: MarketSnapshot) -> Decision:
-        payload = self._build_prompt(snapshot)
-        raw = self.client.complete(payload, model="gemini-2.5-flash", enable_grounding=self.enable_grounding)
-        decision = self._parse_decision(raw, snapshot)
-        risk = self.risk_gate.evaluate(snapshot, decision)
-        if not risk.allow:
-            return Decision(
-                action="HOLD", confidence=decision.confidence,
-                stop_loss_pct=decision.stop_loss_pct,
-                take_profit_pct=decision.take_profit_pct,
-                reasoning=decision.reasoning,
-                model=decision.model,
-                prompt_version=decision.prompt_version,
-                generated_at=decision.generated_at,
-                input_snapshot_id=decision.input_snapshot_id,
-                risk_reason_codes=risk.reason_codes,
-            )
-        return decision
-
-    def _build_prompt(self, snapshot: MarketSnapshot) -> dict[str, Any]:
-        system_prompt = """You are a professional BTC/USDT futures trading decision engine for US stock market hours (09:30-16:00 EST).
-
-CRITICAL INSTRUCTIONS:
-1. You MUST search for real-time Bitcoin market conditions, news, and sentiment BEFORE making a decision.
-2. Focus your search on:
-   - Current Bitcoin price and 24-hour price movements
-   - Major news affecting Bitcoin (Fed policy, SEC regulations, institutional flows, ETF flows)
-   - Market sentiment and technical levels
-   - Macroeconomic events (US inflation, employment reports, interest rate expectations)
-   - Any significant events from the last 24-48 hours
-
-3. After research, provide ONLY a JSON decision matching the exact schema provided.
-4. Your reasoning must be concise (max 100 chars) but incorporate findings from your search.
-5. Set confidence based on signal strength and news sentiment alignment.
-6. Return JSON with no additional text."""
-
-        user_content = f"""Current market snapshot:
-- Price: ${snapshot.price} USD
-- Timestamp: {snapshot.timestamp.isoformat()}
-- Instrument: BTC/USDT:USDT
-
-Search for current Bitcoin market conditions and recent news, then decide whether to:
-1. LONG (bullish) - if strong positive signals and supportive news
-2. SHORT (bearish) - if strong negative signals and adverse news  
-3. HOLD - if uncertain, contradictory signals, or weak conviction
-
-Provide decision as JSON only."""
-
-        return {
-            "system": system_prompt,
-            "contents": [
-                {"role": "user", "parts": [{"text": user_content}]}
-            ],
-            "response_mime_type": "application/json",
-            "response_schema": DECISION_SCHEMA,
-        }
-
-    def _parse_decision(self, raw: Any, snapshot: MarketSnapshot) -> Decision:
+    def _load_position_ids(self) -> set[str]:
+        if self.position_store is None:
+            return set()
         try:
-            text = raw["text"] if isinstance(raw, dict) and "text" in raw else str(raw)
-            cleaned = text.strip()
-            match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-            if not match:
-                raise DecisionValidationError("Model response did not contain JSON")
-            value = json.loads(match.group(0))
-            self._validate(value)
-            if value["action"] != "HOLD" and value["confidence"] < 0.70:
-                value["action"] = "HOLD"
-            return Decision(
-                action=value["action"], confidence=float(value["confidence"]),
-                stop_loss_pct=float(value["stop_loss_pct"]),
-                take_profit_pct=float(value["take_profit_pct"]),
-                reasoning=value["reasoning"],
-                model="gemini-2.5-flash", prompt_version=self.prompt_version,
-                generated_at=datetime.now().astimezone(), input_snapshot_id=snapshot.timestamp.isoformat(),
-            )
-        except Exception as exc:
-            raise DecisionValidationError(f"Invalid model decision: {exc}") from exc
+            data = json.loads(self.position_store.read_text())
+            return {str(position_id) for position_id in data.get("position_ids", [])}
+        except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError):
+            return set()
 
-    @staticmethod
-    def _validate(value: Any) -> None:
-        if not isinstance(value, dict):
-            raise DecisionValidationError("Decision must be an object")
-        missing = [key for key in DECISION_SCHEMA["required"] if key not in value]
-        if missing:
-            raise DecisionValidationError(f"Missing fields: {', '.join(missing)}")
-        if value["action"] not in DECISION_SCHEMA["properties"]["action"]["enum"]:
-            raise DecisionValidationError("Invalid action")
-        if value["take_profit_pct"] <= value["stop_loss_pct"]:
-            raise DecisionValidationError("Take profit must exceed stop loss")
-        if len(value["reasoning"]) > 100:
-            raise DecisionValidationError("Reasoning exceeds 100 characters")
+    def _save_position_ids(self) -> None:
+        if self.position_store is None:
+            return
+        self.position_store.parent.mkdir(parents=True, exist_ok=True)
+        self.position_store.write_text(json.dumps({"position_ids": sorted(self.managed_position_ids)}, indent=2))
+
+    def market_snapshot(self, *, timestamp: datetime) -> MarketSnapshot:
+        if not self.api_key or not self.secret:
+            raise ValueError("Gate.io credentials are required for market data")
+        with httpx.Client(timeout=15.0) as client:
+            response = client.get(
+                f"{self.base_url}/futures/usdt/v1/spot/price",
+                auth=(self.api_key, self.secret),
+                params={"symbol": "BTC/USDT"},
+            )
+            response.raise_for_status()
+            data = response.json()
+        price = float(data["price"])
+        return MarketSnapshot(
+            timestamp=timestamp,
+            source="gateio",
+            instrument="BTC/USDT:USDT",
+            price=price,
+        )
+
+    def get_snapshot(self) -> ExchangeSnapshot:
+        with httpx.Client(timeout=15.0) as client:
+            response = client.get(f"{self.base_url}/futures/usdt/v1/spot/accounts", auth=(self.api_key, self.secret))
+            response.raise_for_status()
+            data = response.json()
+        return ExchangeSnapshot(
+            leverage=float(data.get("leverage", 14.0)), margin_mode=str(data.get("margin_mode", "isolated")),
+            position_count=len(data.get("positions", [])), positions=tuple(data.get("positions", [])),
+        )
+
+    def place_order(self, *, side: str, quantity: float, price: float, stop_loss_price: float, take_profit_price: float) -> OrderResult:
+        payload = {
+            "symbol": "BTC/USDT:USDT", "side": side, "amount": quantity,
+            "price": price, "type": "MARKET", "stopLossPrice": stop_loss_price,
+            "takeProfitPrice": take_profit_price, "closePosition": False,
+        }
+        with httpx.Client(timeout=15.0) as client:
+            response = client.post(f"{self.base_url}/futures/usdt/v1/spot/orders", auth=(self.api_key, self.secret), json=payload)
+            response.raise_for_status()
+            data = response.json()
+        position_id = data.get("positionId") or data.get("position_id")
+        if position_id:
+            self.managed_position_ids.add(str(position_id))
+            self._save_position_ids()
+        return OrderResult(
+            order_id=str(data["id"]), side=side, quantity=float(data.get("amount", quantity)),
+            price=float(data.get("price", price)), status=str(data.get("status", "UNKNOWN")),
+            fee=float(data.get("fee", 0.0)), stop_loss_order_id=data.get("stopLossOrderId"),
+            take_profit_order_id=data.get("takeProfitOrderId"),
+        )
+
+    def close_positions(self) -> list[OrderResult]:
+        results: list[OrderResult] = []
+        with httpx.Client(timeout=15.0) as client:
+            response = client.get(f"{self.base_url}/futures/usdt/v1/spot/positions", auth=(self.api_key, self.secret), params={"symbol": "BTC/USDT:USDT"})
+            response.raise_for_status()
+            positions = response.json()
+        for position in positions:
+            position_id = str(position.get("positionId") or position.get("position_id") or "")
+            if position_id not in self.managed_position_ids or float(position.get("size", 0.0)) == 0:
+                continue
+            response = client.post(f"{self.base_url}/futures/usdt/v1/spot/orders", auth=(self.api_key, self.secret), json={
+                "symbol": "BTC/USDT:USDT", "side": "SELL" if position.get("side") == "LONG" else "BUY",
+                "amount": float(position["size"]), "type": "MARKET", "closePosition": True,
+            })
+            response.raise_for_status()
+            data = response.json()
+            results.append(OrderResult(str(data["id"]), "CLOSE", float(position["size"]), 0.0, str(data.get("status", "UNKNOWN"))))
+            self.managed_position_ids.discard(position_id)
+            self._save_position_ids()
+        return results
+
+    def set_leverage(self, leverage: float) -> bool:
+        with httpx.Client(timeout=15.0) as client:
+            response = client.post(f"{self.base_url}/futures/usdt/v1/spot/leverage", auth=(self.api_key, self.secret), json={"leverage": leverage})
+            response.raise_for_status()
+            return response.json().get("success", True)
+
+
+def market_price_from_decision(decision: Decision, price: float) -> tuple[float, float]:
+    if decision.action == "LONG":
+        stop = price * (1.0 - decision.stop_loss_pct)
+        target = price * (1.0 + decision.take_profit_pct)
+    elif decision.action == "SHORT":
+        stop = price * (1.0 + decision.stop_loss_pct)
+        target = price * (1.0 - decision.take_profit_pct)
+    else:
+        raise ValueError("HOLD cannot create an order")
+    return stop, target
+
+
+def decision_to_order(decision: Decision, price: float, quantity: float) -> dict[str, Any]:
+    if decision.action == "HOLD":
+        raise ValueError("HOLD cannot create an order")
+    stop, target = market_price_from_decision(decision, price)
+    return {
+        "side": "BUY" if decision.action == "LONG" else "SELL",
+        "quantity": quantity,
+        "price": price,
+        "stop_loss_price": stop,
+        "take_profit_price": target,
+    }
+
