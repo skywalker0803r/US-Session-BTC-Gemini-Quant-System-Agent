@@ -28,14 +28,15 @@ class DecisionValidationError(ValueError):
 
 
 class GeminiDecisionEngine:
-    def __init__(self, client: Any, risk_gate: RiskGate, *, prompt_version: str = "v1") -> None:
+    def __init__(self, client: Any, risk_gate: RiskGate, *, prompt_version: str = "v1", enable_grounding: bool = True) -> None:
         self.client = client
         self.risk_gate = risk_gate
         self.prompt_version = prompt_version
+        self.enable_grounding = enable_grounding
 
     def decide(self, snapshot: MarketSnapshot) -> Decision:
         payload = self._build_prompt(snapshot)
-        raw = self.client.complete(payload, model="gemini-2.5-flash")
+        raw = self.client.complete(payload, model="gemini-2.5-flash", enable_grounding=self.enable_grounding)
         decision = self._parse_decision(raw, snapshot)
         risk = self.risk_gate.evaluate(snapshot, decision)
         if not risk.allow:
@@ -53,19 +54,38 @@ class GeminiDecisionEngine:
         return decision
 
     def _build_prompt(self, snapshot: MarketSnapshot) -> dict[str, Any]:
+        system_prompt = """You are a professional BTC/USDT futures trading decision engine for US stock market hours (09:30-16:00 EST).
+
+CRITICAL INSTRUCTIONS:
+1. You MUST search for real-time Bitcoin market conditions, news, and sentiment BEFORE making a decision.
+2. Focus your search on:
+   - Current Bitcoin price and 24-hour price movements
+   - Major news affecting Bitcoin (Fed policy, SEC regulations, institutional flows, ETF flows)
+   - Market sentiment and technical levels
+   - Macroeconomic events (US inflation, employment reports, interest rate expectations)
+   - Any significant events from the last 24-48 hours
+
+3. After research, provide ONLY a JSON decision matching the exact schema provided.
+4. Your reasoning must be concise (max 100 chars) but incorporate findings from your search.
+5. Set confidence based on signal strength and news sentiment alignment.
+6. Return JSON with no additional text."""
+
+        user_content = f"""Current market snapshot:
+- Price: ${snapshot.price} USD
+- Timestamp: {snapshot.timestamp.isoformat()}
+- Instrument: BTC/USDT:USDT
+
+Search for current Bitcoin market conditions and recent news, then decide whether to:
+1. LONG (bullish) - if strong positive signals and supportive news
+2. SHORT (bearish) - if strong negative signals and adverse news  
+3. HOLD - if uncertain, contradictory signals, or weak conviction
+
+Provide decision as JSON only."""
+
         return {
-            "system": "You are a strict BTC/USDT trading decision engine. Return only JSON matching the schema.",
+            "system": system_prompt,
             "contents": [
-                {"role": "user", "parts": [{"text": json.dumps({
-                    "snapshot_id": snapshot.timestamp.isoformat(),
-                    "instrument": "BTC/USDT:USDT",
-                    "price": snapshot.price,
-                    "macro_summary": snapshot.macro_summary,
-                    "orderbook_imbalance": snapshot.orderbook_imbalance,
-                    "cvd": snapshot.cvd,
-                    "news": list(snapshot.news),
-                    "quality_flags": list(snapshot.quality_flags),
-                })}]}
+                {"role": "user", "parts": [{"text": user_content}]}
             ],
             "response_mime_type": "application/json",
             "response_schema": DECISION_SCHEMA,
