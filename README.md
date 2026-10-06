@@ -2,7 +2,24 @@
 
 本專案為 BTC/USDT 永續合約量化交易代理的安全、可觀測實作基礎。依照系統架構與技術實施計畫，涵蓋市場資料採集、Gemini 2.5 Flash 多模態推理、Gate.io 交易執行、風險控制、定時清倉與稽核紀錄。
 
-> **安全提醒：目前預設僅提供模擬／乾跑模式，未啟用真實交易。正式上線前必須完成交易所、法規、資金承受與風險審查。**
+> **安全提醒：目前預設僅提供模擬模式，未啟用真實交易。正式上線前必須完成交易所、法規、資金承受與風險審查。**
+
+## 目錄
+
+- [專案目標](#專案目標)
+- [前置需求](#前置需求)
+- [系統架構](#系統架構)
+- [交易規格](#交易規格)
+- [風險規則](#風險規則)
+- [本機使用](#本機使用)
+- [CLI 參數](#cli-參數)
+- [GitHub Actions 自動化](#github-actions-自動化)
+- [實盤串接](#實盤串接)
+- [測試與驗證](#測試與驗證)
+- [環境變數](#環境變數)
+- [稽核與持倉](#稽核與持倉)
+- [常見問題](#常見問題)
+- [狀態與驗證標準](#狀態與驗證標準)
 
 ## 專案目標
 
@@ -10,9 +27,22 @@
 
 - 以美國 09:30–16:00（台灣時間約 21:30–04:00）作為交易窗口。
 - 使用 Gemini 2.5 Flash 綜合 K 線、期貨、宏觀、新聞、Orderbook 與 CVD。
-- 透過嚴格的 JSON Schema 驗證，避免模型自由文字直接控制交易。
+- 透過嚴格的 JSON 驗證，避免模型自由文字直接控制交易。
 - 在確認風險預算與交易所狀態後，才執行交易。
 - 透過結構化日誌保存決策、下單、成交、清倉與異常事件，支援回放與稽核。
+
+## 前置需求
+
+- Python 3.11 或更新版本；專案的 GitHub Actions 目前使用 Python 3.14。
+- `pip` 與 Git。
+- 使用模擬模式時不需要 Gemini 或 Gate.io API 金鑰。
+- 使用 Live 模式時，需要 Gemini API 金鑰，以及 Gate.io API 金鑰與 Secret。
+- 使用 GitHub Actions 時，必須在 `production` environment 設定 Secrets，並限制可部署者與 Approver。
+
+```bash
+python --version
+python -m pip --version
+```
 
 ## 系統架構
 
@@ -48,14 +78,60 @@
 - 03:50 清倉失敗時，必須升級告警並進入人工介入流程，而不是宣稱零隔夜風險。
 - 初始權益的最大損失上限不可直接以 14x 槓桿推算；必須依實際止損距離、合約數量、手續費與滑點計算。
 
-## 啟動模擬模式
+## 本機使用
+
+### 1. 安裝
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
+```
+
+### 2. 啟動模擬模式
+
+```bash
 python -m quant_agent.cli --events ./events
 ```
 
-預設模擬模式不會呼叫 Gemini、Gate.io 或其他外部服務，並將決策與交易操作記錄到本機稽核目錄。
+模擬模式不會呼叫 Gemini、Gate.io 或其他外部服務。它使用固定的模擬市場價格，並將決策、風險判斷與交易操作紀錄到本機稽核目錄。
+
+### 3. 使用指定市場價格
+
+```bash
+python -m quant_agent.cli --mode simulate --market-price 50000 --events ./events
+```
+
+### 4. 以固定時間執行可重現的時區檢查
+
+```bash
+python -m quant_agent.cli --mode simulate --now "2026-10-06T21:45:00+00:00" --events ./events
+```
+
+`--now` 只用於測試與排程驗證；實際執行時仍使用目前時間。
+
+## CLI 參數
+
+```text
+--events PATH        稽核事件目錄（預設：events）
+--market-price FLOAT 模擬市場價格（預設：50000）
+--mode {simulate,dry-run,live}
+--action {open,close}
+--now ISO8601        測試用的固定時間
+--position-store PATH
+                     管理 Gate.io 位置 ID 的持久化檔案
+```
+
+### 模式差異
+
+| 模式 | Gemini | Gate.io | 交易執行 |
+| --- | --- | --- | --- |
+| `simulate` | 使用內建假決策 | 不連線 | 不執行 |
+| `dry-run` | 使用內建假決策 | 不連線 | 不執行，與模擬模式相同 |
+| `live` | 使用 Gemini API | 使用 Gate.io API | 需金鑰與 `ALLOW_LIVE_TRADING=true` |
+
+> `dry-run` 目前是程式層級的非實盤模式；它不會建立或修改交易所訂單。
 
 ## GitHub Actions 自動化
 
@@ -68,24 +144,37 @@ python -m quant_agent.cli --events ./events
 - 每個工作日最多執行兩次，避免每分鐘消耗 GitHub Actions 免費額度。
 - CLI 以 `America/New_York` 再次檢查時間，避免固定 UTC cron 造成錯時段執行。
 - `workflow_dispatch` 可供人工測試；定時工作流只在 `production` environment 執行。
+- 每個工作日最多執行一次開盤與一次清倉，避免每分鐘消耗免費額度。
+- `concurrency` 的 `group` 會讓同一工作流不重複執行，並避免取消正在執行的交易流程。
+- 工作流會把事件目錄上傳為 30 天的 GitHub Actions Artifact。
 
-## 實盤串接要求
+### 必要的 GitHub Secrets
+
+在 `production` environment 中建立以下 Secrets：
+
+- `GEMINI_API_KEY`
+- `GATEIO_API_KEY`
+- `GATEIO_SECRET`
+
+`ALLOW_LIVE_TRADING` 只在 workflow 的 `env` 中設定為 `true`，不應將其Store為可被一般部署者修改的設定。
+
+## 實盤串接
 
 ```bash
 export GEMINI_API_KEY=...
 export GATEIO_API_KEY=...
 export GATEIO_SECRET=...
 export ALLOW_LIVE_TRADING=true
+
+python -m quant_agent.cli --mode live --action open --events ./events --position-store ./events/positions.json
+python -m quant_agent.cli --mode live --action close --events ./events --position-store ./events/positions.json
 ```
 
-```bash
-python -m quant_agent.cli --mode live --action open --events ./events
-python -m quant_agent.cli --mode live --action close --events ./events
-```
+實盤模式會在啟動時檢查所有必要金鑰與開關。開盤前會驗證槓桿、保證金模式、既有持倉、市場價格與風險預算；清倉只會關閉已追蹤的持倉，避免意外平倉其他位置。
 
-實盤模式要求所有金鑰與 `ALLOW_LIVE_TRADING=true`，並在 GitHub 的 `production` environment 中設定必要的 approver。這樣可以避免只有程式碼權限就能啟用實盤交易。
+> **重要：** 只有程式碼權限並不代表可啟用實盤模式。正式部署前必須完成交易所 Testnet 驗證、環境權限、Approver 與人工風險審查。
 
-## 執行測試
+## 測試與驗證
 
 ```bash
 python -m pytest
@@ -99,23 +188,42 @@ python -m compileall -q src tests
 - 槓桿、持倉與數量限制。
 - 交易所執行前的安全檢查。
 - 結構化日誌的持久化與稽核事件。
+- America/New_York 時區與工作窗口。
+
+```bash
+python -m pytest
+python -m compileall -q src tests
+git diff --check
+```
 
 ## 環境變數
 
-實際連線前，可透過環境變數提供必要設定：
+| 變數 | 用途 | 必要性 |
+| --- | --- | --- |
+| `GEMINI_API_KEY` | Gemini 產生決策 | Live 模式必要 |
+| `GATEIO_API_KEY` | Gate.io API 認證 | Live 模式必要 |
+| `GATEIO_SECRET` | Gate.io API 認證 | Live 模式必要 |
+| `ALLOW_LIVE_TRADING` | 啟用實盤執行 | Live 模式必要，值為 `true`、`1` 或 `yes` |
 
-```bash
-export GEMINI_API_KEY=...
-export GATEIO_API_KEY=...
-export GATEIO_SECRET=...
-```
+不要將金鑰寫入程式碼、Shell 歷史、GitHub Artifact 或稽核日誌。金鑰應透過 GitHub Actions Secrets 或安全的本機環境變數來源提供。
 
-```bash
-# 產生可觀測的事件紀錄
-python -m quant_agent.cli --events ./events
-```
+## 稽核與持倉
 
-> 預設 CLI 不會使用以上金鑰。實際交易所適配器應只在受控制的部署環境中啟用，並禁止將金鑰寫入原始碼或稽核日誌。
+- 事件目錄預設位於 `./events`。
+- 每個事件是獨立的 JSON 檔案，可透過 `EventStore` 讀取與重放。
+- 開盤流程會記錄 `DECISION`、`RISK_REJECTED`、`EXECUTION_REJECTED`、`ORDER_PLACED` 或 `ORDER_FAILED`。
+- 清倉流程會記錄 `CLOSE_ALL` 與失敗事件。
+- `--position-store` 會保存已管理的 Gate.io position ID；清倉只處理這些編號。
+- 事件與持倉檔案可能包含交易成本或帳戶狀態，請保護其權限並避免上傳到不受控的位置。
+
+## 常見問題
+
+- **缺少 `GEMINI_API_KEY`：** 使用 Live 模式時必須提供金鑰。
+- **缺少 `ALLOW_LIVE_TRADING`：** Live 模式會直接停止，避免誤啟用實盤。
+- **時段不正確：** CLI 以 `America/New_York` 檢查開盤與清倉窗口；不要只依賴 UTC cron。
+- **交易所回傳 401 或 403：** 檢查 API 金鑰、Secret、權限與 API 使用端點。
+- **開盤時已有持倉：** `QuantAgent` 會拒絕新單，避免重複開單。
+- **清倉沒有結果：** 確認位置 ID 已存在於 `position-store`，並檢查交易所 API 與事件紀錄。
 
 ## 主要檔案
 
