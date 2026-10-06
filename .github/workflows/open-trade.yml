@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 concurrency:
-  open-trade:
-    max-parallel: 1
+  group: open-trade
+  cancel-in-progress: false
 
 jobs:
   open-trade:
