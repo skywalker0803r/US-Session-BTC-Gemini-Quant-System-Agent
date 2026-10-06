@@ -19,7 +19,11 @@ class MarketSnapshot:
     cvd: float | None = None
     macro_summary: str | None = None
     news: tuple[dict[str, Any], ...] = ()
+    vix: float | None = None
+    dxy: float | None = None
+    nq_es_spread: float | None = None
     quality_flags: tuple[str, ...] = ()
+    data_sources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,6 +78,8 @@ class OrderResult:
     stop_loss_order_id: str | None = None
     take_profit_order_id: str | None = None
     error: str | None = None
+    request_payload: dict[str, Any] | None = None
+    exchange_response: dict[str, Any] | None = None
 
 
 @dataclass

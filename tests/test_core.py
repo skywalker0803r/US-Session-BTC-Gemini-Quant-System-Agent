@@ -1,129 +1,72 @@
-from __future__ import annotations
+from datetime import datetime, timezone
 
-import json
-import re
-from datetime import datetime
-from typing import Any
+import pytest
 
-from .models import Decision, MarketSnapshot
-from .risk import RiskGate
-
-
-DECISION_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["action", "confidence", "stop_loss_pct", "take_profit_pct", "reasoning"],
-    "properties": {
-        "action": {"enum": ["LONG", "SHORT", "HOLD"]},
-        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-        "stop_loss_pct": {"type": "number", "minimum": 0.008, "maximum": 0.020},
-        "take_profit_pct": {"type": "number", "minimum": 0.020, "maximum": 0.040},
-        "reasoning": {"type": "string", "maxLength": 100},
-    },
-}
+from quant_agent.decision import DecisionValidationError, GeminiDecisionEngine
+from quant_agent.models import Decision, MarketSnapshot, RiskBudget
+from quant_agent.risk import RiskGate
+from quant_agent.storage import EventStore
 
 
-class DecisionValidationError(ValueError):
-    pass
+class FakeGemini:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def complete(self, payload, *, model):
+        return {"text": self.payload}
 
 
-class GeminiDecisionEngine:
-    def __init__(self, client: Any, risk_gate: RiskGate, *, prompt_version: str = "v1", enable_grounding: bool = True) -> None:
-        self.client = client
-        self.risk_gate = risk_gate
-        self.prompt_version = prompt_version
-        self.enable_grounding = enable_grounding
+def snapshot() -> MarketSnapshot:
+    return MarketSnapshot(
+        timestamp=datetime.now(timezone.utc), source="test", instrument="BTC/USDT:USDT",
+        orderbook_imbalance=0.01, cvd=0.0, quality_flags=(),
+    )
 
-    def decide(self, snapshot: MarketSnapshot) -> Decision:
-        payload = self._build_prompt(snapshot)
-        raw = self.client.complete(payload, model="gemini-2.5-flash", enable_grounding=self.enable_grounding)
-        decision = self._parse_decision(raw, snapshot)
-        risk = self.risk_gate.evaluate(snapshot, decision)
-        if not risk.allow:
-            return Decision(
-                action="HOLD", confidence=decision.confidence,
-                stop_loss_pct=decision.stop_loss_pct,
-                take_profit_pct=decision.take_profit_pct,
-                reasoning=decision.reasoning,
-                model=decision.model,
-                prompt_version=decision.prompt_version,
-                generated_at=decision.generated_at,
-                input_snapshot_id=decision.input_snapshot_id,
-                risk_reason_codes=risk.reason_codes,
-            )
-        return decision
 
-    def _build_prompt(self, snapshot: MarketSnapshot) -> dict[str, Any]:
-        system_prompt = """You are a professional BTC/USDT futures trading decision engine for US stock market hours (09:30-16:00 EST).
+def valid_decision(action="LONG") -> Decision:
+    return Decision(
+        action=action, confidence=0.82, stop_loss_pct=0.012,
+        take_profit_pct=0.028, reasoning="Trend is constructive", model="gemini-2.5-flash",
+        prompt_version="v1", generated_at=datetime.now(timezone.utc), input_snapshot_id="test",
+    )
 
-CRITICAL INSTRUCTIONS:
-1. You MUST search for real-time Bitcoin market conditions, news, and sentiment BEFORE making a decision.
-2. Focus your search on:
-   - Current Bitcoin price and 24-hour price movements
-   - Major news affecting Bitcoin (Fed policy, SEC regulations, institutional flows, ETF flows)
-   - Market sentiment and technical levels
-   - Macroeconomic events (US inflation, employment reports, interest rate expectations)
-   - Any significant events from the last 24-48 hours
 
-3. After research, provide ONLY a JSON decision matching the exact schema provided.
-4. Your reasoning must be concise (max 100 chars) but incorporate findings from your search.
-5. Set confidence based on signal strength and news sentiment alignment.
-6. Return JSON with no additional text."""
+def test_decision_schema_and_threshold_validation():
+    engine = GeminiDecisionEngine(FakeGemini('{"action":"LONG","confidence":0.82,"stop_loss_pct":0.012,"take_profit_pct":0.028,"reasoning":"ok"}'), RiskGate(RiskBudget(10_000)))
+    decision = engine.decide(snapshot())
+    assert decision.action == "LONG"
+    assert decision.confidence == 0.82
 
-        user_content = f"""Current market snapshot:
-- Price: ${snapshot.price} USD
-- Timestamp: {snapshot.timestamp.isoformat()}
-- Instrument: BTC/USDT:USDT
+    bad = FakeGemini('{"action":"LONG","confidence":0.5,"stop_loss_pct":0.012,"take_profit_pct":0.028,"reasoning":"ok"}')
+    engine = GeminiDecisionEngine(bad, RiskGate(RiskBudget(10_000)))
+    decision = engine.decide(snapshot())
+    assert decision.action == "HOLD"
+    assert decision.risk_reason_codes == ("CONFIDENCE_BELOW_THRESHOLD",)
 
-Search for current Bitcoin market conditions and recent news, then decide whether to:
-1. LONG (bullish) - if strong positive signals and supportive news
-2. SHORT (bearish) - if strong negative signals and adverse news  
-3. HOLD - if uncertain, contradictory signals, or weak conviction
 
-Provide decision as JSON only."""
+def test_invalid_json_is_rejected():
+    engine = GeminiDecisionEngine(FakeGemini("not-json"), RiskGate(RiskBudget(10_000)))
+    with pytest.raises(DecisionValidationError):
+        engine.decide(snapshot())
 
-        return {
-            "system": system_prompt,
-            "contents": [
-                {"role": "user", "parts": [{"text": user_content}]}
-            ],
-            "response_mime_type": "application/json",
-            "response_schema": DECISION_SCHEMA,
-        }
 
-    def _parse_decision(self, raw: Any, snapshot: MarketSnapshot) -> Decision:
-        try:
-            text = raw["text"] if isinstance(raw, dict) and "text" in raw else str(raw)
-            cleaned = text.strip()
-            match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-            if not match:
-                raise DecisionValidationError("Model response did not contain JSON")
-            value = json.loads(match.group(0))
-            self._validate(value)
-            if value["action"] != "HOLD" and value["confidence"] < 0.70:
-                value["action"] = "HOLD"
-            return Decision(
-                action=value["action"], confidence=float(value["confidence"]),
-                stop_loss_pct=float(value["stop_loss_pct"]),
-                take_profit_pct=float(value["take_profit_pct"]),
-                reasoning=value["reasoning"],
-                model="gemini-2.5-flash", prompt_version=self.prompt_version,
-                generated_at=datetime.now().astimezone(), input_snapshot_id=snapshot.timestamp.isoformat(),
-            )
-        except Exception as exc:
-            raise DecisionValidationError(f"Invalid model decision: {exc}") from exc
+def test_risk_gate_rejects_unsafe_trade():
+    gate = RiskGate(RiskBudget(10_000))
+    low = valid_decision()
+    low = Decision(low.action, 0.69, low.stop_loss_pct, low.take_profit_pct, low.reasoning, low.model, low.prompt_version, low.generated_at, low.input_snapshot_id)
+    result = gate.evaluate(snapshot(), low)
+    assert not result.allow
+    assert "CONFIDENCE_BELOW_THRESHOLD" in result.reason_codes
 
-    @staticmethod
-    def _validate(value: Any) -> None:
-        if not isinstance(value, dict):
-            raise DecisionValidationError("Decision must be an object")
-        missing = [key for key in DECISION_SCHEMA["required"] if key not in value]
-        if missing:
-            raise DecisionValidationError(f"Missing fields: {', '.join(missing)}")
-        if value["action"] not in DECISION_SCHEMA["properties"]["action"]["enum"]:
-            raise DecisionValidationError("Invalid action")
-        if value["take_profit_pct"] <= value["stop_loss_pct"]:
-            raise DecisionValidationError("Take profit must exceed stop loss")
-        if len(value["reasoning"]) > 100:
-            raise DecisionValidationError("Reasoning exceeds 100 characters")
 
+def test_quantity_and_position_limits():
+    gate = RiskGate(RiskBudget(10_000))
+    assert gate.calculate_quantity(10_000, 50_000, 0.01) == 0.004
+    assert gate.position_limit(10_000, 0.004, 50_000)
+    assert not gate.position_limit(10_000, 1.0, 50_000)
+
+
+def test_event_store_persists_complete_audit_events(tmp_path):
+    store = EventStore(tmp_path)
+    store.append(type("Event", (), {"event_id": "event-1", "timestamp": datetime.now(timezone.utc), "type": "TEST", "to_dict": lambda self: {"event_id": "event-1", "type": "TEST"}})())
+    assert store.list_events("TEST")[0]["event_id"] == "event-1"

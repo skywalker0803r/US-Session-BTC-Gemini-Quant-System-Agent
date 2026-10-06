@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from math import isfinite
 
 from .models import Decision, MarketSnapshot, RiskBudget, RiskDecision
 
 
 class RiskGate:
-    def __init__(self, budget: RiskBudget, *, max_wave_pct: float = 0.10) -> None:
+    def __init__(self, budget: RiskBudget, *, max_wave_pct: float = 0.10, max_data_age_minutes: float = 5.0) -> None:
         self.budget = budget
         self.max_wave_pct = max_wave_pct
+        self.max_data_age_minutes = max_data_age_minutes
 
     def evaluate(self, snapshot: MarketSnapshot, decision: Decision) -> RiskDecision:
         reasons: list[str] = []
         if snapshot.quality_flags:
             reasons.append("DATA_QUALITY_INVALID")
+        if self._is_stale(snapshot.timestamp):
+            reasons.append("DATA_STALE")
         if not 0.0 <= decision.confidence <= 1.0:
             reasons.append("INVALID_CONFIDENCE")
         if decision.confidence < 0.70:
@@ -33,6 +37,14 @@ class RiskGate:
         if reasons:
             return RiskDecision(False, tuple(reasons), "; ".join(reasons))
         return RiskDecision(True, (), "All risk gates passed")
+
+    def _is_stale(self, timestamp: datetime) -> bool:
+        try:
+            snapshot_time = timestamp.astimezone(timezone.utc)
+            age_minutes = (datetime.now(timezone.utc) - snapshot_time).total_seconds() / 60.0
+            return age_minutes > self.max_data_age_minutes
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return True
 
     def calculate_quantity(
         self, equity: float, price: float, stop_loss_pct: float, risk_budget_pct: float = 0.01

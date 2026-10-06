@@ -6,6 +6,7 @@ from typing import Any, Protocol
 from .decision import GeminiDecisionEngine
 from .models import Decision, Event, MarketSnapshot, OrderResult, RiskBudget, utc_now
 from .risk import RiskGate
+from .scheduler import is_close_window
 from .storage import EventStore, event_id
 
 
@@ -33,6 +34,15 @@ class QuantAgent:
 
     def run_once(self, *, timestamp: datetime | None = None) -> Decision:
         now = timestamp or utc_now()
+        if is_close_window(now):
+            decision = Decision(
+                action="HOLD", confidence=0.0, stop_loss_pct=0.008,
+                take_profit_pct=0.020, reasoning="Close window pending; no new trade",
+                model="local", prompt_version="v1", generated_at=now,
+                input_snapshot_id="close-window", risk_reason_codes=("CLOSE_WINDOW_PENDING",),
+            )
+            self._record_event("RISK_REJECTED", decision=decision.as_dict(), reason_codes=list(decision.risk_reason_codes), reason=decision.reasoning)
+            return decision
         snapshot = self.market_data.snapshot(timestamp=now)
         decision = self.gemini.decide(snapshot)
         self._record_event("DECISION", snapshot_id=snapshot.timestamp.isoformat(), decision=decision.as_dict())
